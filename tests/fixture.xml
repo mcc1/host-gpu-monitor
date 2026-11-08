@@ -1,0 +1,8 @@
+<nvidia_smi_log>
+  <gpu><uuid>GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</uuid>
+    <fb_memory_usage><total>12288 MiB</total><used>5273 MiB</used><free>6640 MiB</free></fb_memory_usage>
+    <temperature><gpu_temp>52 C</gpu_temp></temperature>
+    <utilization><gpu_util>14 %</gpu_util></utilization>
+    <gpu_power_readings><instant_power_draw>32.5 W</instant_power_draw></gpu_power_readings>
+  </gpu>
+</nvidia_smi_log>

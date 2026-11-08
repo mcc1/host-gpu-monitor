@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "host-gpu-monitor"
+version = "0.1.0"
+description = "Read-only GPU snapshots and optional host telemetry for Linux"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+host-gpu-monitor = "host_gpu_monitor.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["host_gpu_monitor*"]
