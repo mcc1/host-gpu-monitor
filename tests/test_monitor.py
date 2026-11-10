@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,8 +10,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from host_gpu_monitor.__main__ import policies
+from host_gpu_monitor.__main__ import execution_locks, policies
 from host_gpu_monitor.daemon import local_listener, request_handler
+from host_gpu_monitor import lxc
 from host_gpu_monitor.sampler import Sampler, parse_xml, unix_snapshot
 from host_gpu_monitor.telemetry import handler, render_metrics
 
@@ -35,6 +37,105 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(device["callerHasContext"])
         self.assertNotIn("temperatureC", device)
         self.assertEqual([p["owner"] for p in device["processes"]], ["self", "external"])
+
+    def test_execution_owner_requires_the_exact_exclusive_flock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "execution.lock"
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            relative = path.relative_to("/")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                self.assertIsNone(lxc.execution_owner(os.getpid(), os.getuid(), relative))
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                dev, ino, pid, _ = lxc.execution_owner(os.getpid(), os.getuid(), relative)
+                info = os.fstat(fd)
+                self.assertEqual((dev, ino, pid), (info.st_dev, info.st_ino, os.getpid()))
+                alias = path.with_name("alias")
+                alias.symlink_to(path)
+                self.assertIsNone(lxc.execution_owner(os.getpid(), os.getuid(), alias.relative_to("/")))
+                self.assertIsNone(lxc.execution_owner(os.getpid(), os.getuid() + 1, relative))
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                self.assertIsNone(lxc.execution_owner(os.getpid(), os.getuid(), relative))
+            finally:
+                os.close(fd)
+
+
+class ExecutionLeaseSampleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ownership_must_bracket_the_sample_and_still_match_on_cache_read(self):
+        original = (45, 100, 40, "original")
+        owner = original
+        during_read = original
+
+        def source():
+            return owner
+
+        async def read_xml():
+            nonlocal owner
+            owner = during_read
+            return XML
+
+        sampler = Sampler(read_xml)
+        sampler.lease_sources.add(source)
+        sample = await sampler.refresh()
+        self.assertEqual(sampler.execution_lease(sample, source, 10), {"lock": [45, 100], "ownerHostPid": 40})
+        self.assertIsNone(sampler.execution_lease(sample, source, 40))
+        owner = (45, 100, 40, "reused-pid")
+        self.assertIs(await sampler.refresh(), sample)
+        self.assertIsNone(sampler.execution_lease(sample, source, 10))
+        sampler.completed_at = float("-inf")
+        during_read = (45, 100, 50, "different-owner")
+        sample = await sampler.refresh()
+        self.assertIsNone(sampler.execution_lease(sample, source, 10))
+
+    async def test_unix_response_only_attests_a_live_lock_owner(self):
+        async def read_xml():
+            return XML
+
+        sampler = Sampler(read_xml)
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "execution.lock"
+            owner = await asyncio.create_subprocess_exec(
+                sys.executable, "-c",
+                "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600); "
+                "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()",
+                str(lock), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(await asyncio.wait_for(owner.stdout.readline(), 2), b"locked\n")
+
+                def source():
+                    return lxc.execution_owner(os.getpid(), os.getuid(), lock.relative_to("/"))
+
+                sampler.lease_sources.add(source)
+                path = Path(directory) / "monitor.sock"
+                handler = request_handler(sampler, os.getuid(), os.getpid(), lease_source=source)
+                async with await asyncio.start_unix_server(handler, path):
+                    async def query():
+                        reader, writer = await asyncio.open_unix_connection(path)
+                        try:
+                            writer.write(b'{"schemaVersion":1,"op":"gpu.snapshot"}\n')
+                            await writer.drain()
+                            return json.loads(await asyncio.wait_for(reader.readline(), 2))
+                        finally:
+                            writer.close()
+                            await writer.wait_closed()
+
+                    info = lock.stat()
+                    self.assertEqual((await query())["executionLease"],
+                                     {"lock": [info.st_dev, info.st_ino], "ownerHostPid": owner.pid})
+                    owner.stdin.close()
+                    self.assertEqual(await asyncio.wait_for(owner.wait(), 2), 0)
+                    self.assertNotIn("executionLease", await query())
+            finally:
+                if owner.returncode is None:
+                    owner.kill()
+                    await owner.wait()
+
+    def test_execution_lock_paths_are_explicitly_scoped_to_configured_containers(self):
+        self.assertEqual(execution_locks(["101=home/user/lock"], [101]), {101: Path("home/user/lock")})
+        for item in ("102=home/user/lock", "101=/etc/passwd", "101=home/../lock", "101="):
+            with self.assertRaises(ValueError):
+                execution_locks([item], [101])
 
     def test_metrics_report_valid_gauges_and_preserve_unknown(self):
         metrics = render_metrics(parse_xml(XML), {"renderer.service"})

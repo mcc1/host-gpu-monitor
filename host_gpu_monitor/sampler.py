@@ -119,17 +119,32 @@ class Sampler:
         self._lock = asyncio.Lock()
         self.latest = None
         self.completed_at = float("-inf")
+        self.lease_sources = set()
+        self.lease_owners = {}
 
     async def refresh(self):
         async with self._lock:
             if time.monotonic() - self.completed_at < 1:
                 return self.latest
+            owners = {source: source() for source in self.lease_sources}
             try:
                 self.latest = parse_xml(await self.read_xml())
             except (OSError, RuntimeError, TimeoutError, ValueError, ET.ParseError):
                 self.latest = None
             self.completed_at = time.monotonic()
+            self.lease_owners = {source: owner for source, owner in owners.items()
+                                 if source in self.lease_sources and owner is not None and owner == source()}
             return self.latest
+
+    def execution_lease(self, sample, source, peer_pid):
+        # A cached sample cannot prove the new owner after a handoff. The
+        # identity includes PID starttime, in addition to the lock inode.
+        owner = self.lease_owners.get(source)
+        if sample is self.latest and owner is not None and owner == source():
+            dev, ino, pid, _ = owner
+            if pid != peer_pid:
+                return {"lock": [dev, ino], "ownerHostPid": pid}
+        return None
 
 
 def unix_snapshot(sample, pid, uid, descendant=is_descendant):

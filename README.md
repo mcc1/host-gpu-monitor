@@ -42,6 +42,14 @@ runtime. Its guest socket remains `/run/host-gpu-monitor/gpu.sock`. It checks th
 peer UID and PID namespace. Run `--no-unix` if only LXC sockets are wanted.
 Deploying the LXC adapter should first be tested on a disposable container.
 
+For a workload that serializes GPU access with an exclusive Linux `flock`,
+configure `--lxc-execution-lock CTID=relative/path/to/execution.lock` for that
+LXC. The Unix response may then include `executionLease` with `lock` (device
+number and inode) and `ownerHostPid` when the same authorized lock holder was
+confirmed around the GPU sample and remains the owner at response time. This
+does not change `selfMb`, `othersMb`, or the process list. A scheduler should
+only use the optional proof if its execution target also uses that exact lock.
+
 ## KVM/QEMU guest VM snapshot v2
 
 Enable a host-side `AF_VSOCK` listener with an explicit CID-to-GPU allowlist.

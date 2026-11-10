@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 import fcntl
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -45,7 +46,7 @@ def limit_clients(handler, limit=MAX_CLIENTS):
     return handle
 
 
-def request_handler(sampler, allowed_uid=None, init_pid=None, vm_policy=None):
+def request_handler(sampler, allowed_uid=None, init_pid=None, vm_policy=None, lease_source=None):
     version = 1 if vm_policy is None else 2
 
     async def handle(reader, writer):
@@ -85,7 +86,12 @@ def request_handler(sampler, allowed_uid=None, init_pid=None, vm_policy=None):
                 return vm_snapshot(sample, vm_policy[cid])
             if identity != proc_identity(pid) or not authorized(pid, uid):
                 return unknown(version, "peer_changed")
-            return unix_snapshot(sample, pid, uid)
+            response = unix_snapshot(sample, pid, uid)
+            if lease_source is not None:
+                proof = sampler.execution_lease(sample, lease_source, pid)
+                if proof is not None:
+                    response["executionLease"] = proof
+            return response
         except (OSError, ValueError, TimeoutError, IndexError):
             return unknown(version, "probe_unavailable")
 
@@ -205,12 +211,13 @@ async def vsock_listener(port, policy, sampler):
             yield
 
 
-async def lxc_listener(ctid, guest_uid, sampler):
+async def lxc_listener(ctid, guest_uid, sampler, execution_lock=None):
     lock = lxc.acquire_lock(ctid)
     try:
         while True:
             directory = None
             owns_socket = False
+            lease_source = None
             try:
                 init_pid = int((await command("/usr/bin/lxc-info", "-n", str(ctid), "-pH")).strip())
                 identity = proc_identity(init_pid)
@@ -222,12 +229,19 @@ async def lxc_listener(ctid, guest_uid, sampler):
                 lxc.remove_socket(directory)
                 with lxc.bind_socket(directory, uid, root_uid, root_gid) as sock:
                     owns_socket = True
-                    async with await start_unix_server(request_handler(sampler, uid, init_pid), sock):
+                    if execution_lock is not None:
+                        lease_source = partial(lxc.execution_owner, init_pid, uid, execution_lock)
+                        sampler.lease_sources.add(lease_source)
+                    handler = request_handler(sampler, uid, init_pid, lease_source=lease_source)
+                    async with await start_unix_server(handler, sock):
                         while proc_identity(init_pid) == identity:
                             await asyncio.sleep(2)
             except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
                 print(f"LXC {ctid}: {exc}", flush=True)
             finally:
+                if lease_source is not None:
+                    sampler.lease_sources.discard(lease_source)
+                    sampler.lease_owners.pop(lease_source, None)
                 if directory is not None:
                     try:
                         if owns_socket:
@@ -265,7 +279,10 @@ async def serve(args, sampler=None):
                 else:
                     metrics_active = True
             async with asyncio.TaskGroup() as tasks:
-                background = [tasks.create_task(lxc_listener(ct, args.guest_uid, sampler)) for ct in args.lxc_ctid]
+                background = [
+                    tasks.create_task(lxc_listener(ct, args.guest_uid, sampler, args.lxc_execution_lock.get(ct)))
+                    for ct in args.lxc_ctid
+                ]
                 if metrics_active:
                     background.append(tasks.create_task(telemetry.refresh_periodically(sampler, args.interval)))
                 print("host-gpu-monitor ready", flush=True)

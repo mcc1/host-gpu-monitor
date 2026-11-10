@@ -29,6 +29,19 @@ def policies(items):
     return result
 
 
+def execution_locks(items, allowed_ctids):
+    result = {}
+    for item in items:
+        ctid, sep, value = item.partition("=")
+        path = Path(value)
+        if not sep or not ctid.isdecimal() or int(ctid) not in allowed_ctids or int(ctid) in result:
+            raise ValueError("execution lock must specify one configured CTID")
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise ValueError("execution lock path must be relative to the guest root")
+        result[int(ctid)] = path
+    return result
+
+
 def read_snapshot(args):
     vsock = args.vsock_port is not None
     family = socket.AF_VSOCK if vsock else socket.AF_UNIX
@@ -56,6 +69,7 @@ def main(argv=None):
     server.add_argument("--uid", type=int, default=os.geteuid())
     server.add_argument("--lxc-ctid", action="append", type=int, default=[])
     server.add_argument("--guest-uid", type=int, default=1000)
+    server.add_argument("--lxc-execution-lock", action="append", default=[], metavar="CTID=PATH")
     server.add_argument("--vsock-port", type=int)
     server.add_argument("--vsock-allow", action="append", default=[])
     server.add_argument("--telemetry", action="store_true")
@@ -84,6 +98,7 @@ def main(argv=None):
             parser.error("UID is out of range")
         if len(set(args.lxc_ctid)) != len(args.lxc_ctid) or any(ct <= 0 for ct in args.lxc_ctid):
             parser.error("LXC IDs must be distinct positive integers")
+        args.lxc_execution_lock = execution_locks(args.lxc_execution_lock, args.lxc_ctid)
         if args.no_unix and not (args.lxc_ctid or args.vsock_port or args.telemetry):
             parser.error("at least one listener is required")
         asyncio.run(serve(args))

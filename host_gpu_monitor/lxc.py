@@ -1,6 +1,6 @@
 """Optional Linux LXC runtime socket adapter."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import ctypes
 import fcntl
 import os
@@ -8,8 +8,54 @@ from pathlib import Path
 import socket
 import stat
 
+from .sampler import proc_identity
+
 class FatalCredentialError(Exception):
     pass
+
+
+def lock_stat(init_pid, relative_path):
+    # The configured guest-relative path is anchored to the LXC root. Never
+    # follow a guest-controlled symlink on the privileged side of the boundary.
+    with ExitStack() as stack:
+        def open_fd(name, flags, **kwargs):
+            fd = os.open(name, flags, **kwargs)
+            stack.callback(os.close, fd)
+            return fd
+
+        flags = os.O_PATH | os.O_DIRECTORY
+        directory = open_fd(f"/proc/{init_pid}/root", flags)
+        for part in relative_path.parts[:-1]:
+            directory = open_fd(part, flags | os.O_NOFOLLOW, dir_fd=directory)
+        return os.fstat(open_fd(relative_path.name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory))
+
+
+def flock_owner(locks, device, inode):
+    target = (os.major(device), os.minor(device), inode)
+    owners = []
+    for line in locks.splitlines():
+        fields = line.split()
+        if (len(fields) == 8 and fields[1:4] == ["FLOCK", "ADVISORY", "WRITE"]
+                and fields[6:] == ["0", "EOF"]):
+            major, minor, number = fields[5].split(":")
+            if (int(major, 16), int(minor, 16), int(number)) == target:
+                owners.append(int(fields[4]))
+    return owners[0] if len(owners) == 1 and owners[0] > 0 else None
+
+
+def execution_owner(init_pid, uid, relative_path):
+    try:
+        info = lock_stat(init_pid, relative_path)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or info.st_mode & 0o077):
+            return None
+        pid = flock_owner(Path("/proc/locks").read_text(), info.st_dev, info.st_ino)
+        if (pid is not None and Path(f"/proc/{pid}").stat().st_uid == uid
+                and os.readlink(f"/proc/{pid}/ns/pid") == os.readlink(f"/proc/{init_pid}/ns/pid")):
+            return info.st_dev, info.st_ino, pid, proc_identity(pid)[1]
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def mapped_id(init_pid, uid, kind="uid"):
