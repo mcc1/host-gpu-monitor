@@ -73,9 +73,30 @@ def optional_number(text, unit):
     return value if suffix == unit and math.isfinite(value) else None
 
 
+def optional_text(text):
+    text = (text or "").strip()
+    return text if text and text != "N/A" and len(text) <= 128 else None
+
+
+def performance_state(text):
+    text = optional_text(text)
+    return int(text[1:]) if text and text[0] == "P" and text[1:].isdecimal() else None
+
+
+# Device readings sent to Unix v1 clients. Each one is null when the driver does not report it.
+DEVICE_TELEMETRY = (
+    "name", "pciBusId", "driverVersion", "cudaVersion", "temperatureC", "utilizationPercent",
+    "memoryUtilizationPercent", "powerWatts", "powerLimitWatts", "fanPercent", "performanceState",
+    "smClockMhz", "smClockMaxMhz", "memClockMhz",
+)
+
+
 def parse_xml(xml):
     devices = []
-    for gpu in ET.fromstring(xml).findall("gpu"):
+    root = ET.fromstring(xml)
+    driver = optional_text(root.findtext("driver_version"))
+    cuda = optional_text(root.findtext("cuda_version"))
+    for gpu in root.findall("gpu"):
         processes = []
         seen = set()
         for proc in gpu.findall("processes/process_info"):
@@ -98,13 +119,26 @@ def parse_xml(xml):
         power = gpu.findtext("gpu_power_readings/power_draw") or gpu.findtext("power_readings/power_draw")
         if not power:
             power = gpu.findtext("gpu_power_readings/instant_power_draw")
+        limit = (gpu.findtext("gpu_power_readings/current_power_limit")
+                 or gpu.findtext("power_readings/power_limit"))
         devices.append({
             "gpuUuid": uuid, "totalMb": total, "usedMb": used, "freeMb": free,
             "unattributedMb": max(0, used - sum(p["usedMb"] for p in processes)),
             "processes": processes,
+            "name": optional_text(gpu.findtext("product_name")),
+            "pciBusId": optional_text(gpu.findtext("pci/pci_bus_id")),
+            "driverVersion": driver,
+            "cudaVersion": cuda,
             "temperatureC": optional_number(gpu.findtext("temperature/gpu_temp"), "C"),
             "utilizationPercent": optional_number(gpu.findtext("utilization/gpu_util"), "%"),
+            "memoryUtilizationPercent": optional_number(gpu.findtext("utilization/memory_util"), "%"),
             "powerWatts": optional_number(power, "W"),
+            "powerLimitWatts": optional_number(limit, "W"),
+            "fanPercent": optional_number(gpu.findtext("fan_speed"), "%"),
+            "performanceState": performance_state(gpu.findtext("performance_state")),
+            "smClockMhz": optional_number(gpu.findtext("clocks/sm_clock"), "MHz"),
+            "smClockMaxMhz": optional_number(gpu.findtext("max_clocks/sm_clock"), "MHz"),
+            "memClockMhz": optional_number(gpu.findtext("clocks/mem_clock"), "MHz"),
         })
     if not devices:
         raise ValueError("GPU unavailable")
@@ -177,6 +211,7 @@ def unix_snapshot(sample, pid, uid, descendant=is_descendant, local_pid=peer_nam
         other_mb = sum(p["usedMb"] for p in processes if p["owner"] == "external")
         devices.append({
             **{key: device[key] for key in ("gpuUuid", "totalMb", "usedMb", "freeMb", "unattributedMb")},
+            **{key: device.get(key) for key in DEVICE_TELEMETRY},
             "selfMb": self_mb, "othersMb": other_mb, "processes": processes,
             "callerHasContext": any(p["pid"] == pid for p in processes),
         })

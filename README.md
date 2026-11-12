@@ -34,6 +34,13 @@ LXC), else `null`. Processes in nested namespaces, such as Docker inside an
 LXC, stay `null`. A client can use it to match host rows to its own `/proc`
 without guessing. The value is read when the response is built, so a PID that
 exits and is reused within the one-second sample cache can be misattributed.
+Each device also carries the driver's readings: `name`, `pciBusId`,
+`driverVersion`, `cudaVersion`, `temperatureC`, `utilizationPercent`,
+`memoryUtilizationPercent`, `powerWatts`, `powerLimitWatts`, `fanPercent`,
+`performanceState`, `smClockMhz`, `smClockMaxMhz` and `memClockMhz`. A
+reading the driver does not report is `null`, never 0. A client without its
+own GPU device, such as an LXC with no NVIDIA passthrough, can show the GPU
+from these fields alone. The VM protocol v2 does not include them.
 A caller
 with no GPU context can still read the physical inventory. Unavailable data
 returns `status:"unknown"` with a reason. Requests and responses are bounded.

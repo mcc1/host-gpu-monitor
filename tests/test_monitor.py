@@ -13,7 +13,9 @@ from unittest.mock import patch
 from host_gpu_monitor.__main__ import execution_locks, policies
 from host_gpu_monitor.daemon import local_listener, request_handler
 from host_gpu_monitor import lxc
-from host_gpu_monitor.sampler import Sampler, parse_xml, peer_namespace_pid, unix_snapshot
+from host_gpu_monitor.sampler import (
+    DEVICE_TELEMETRY, Sampler, parse_xml, peer_namespace_pid, unix_snapshot, vm_snapshot,
+)
 from host_gpu_monitor.telemetry import handler, render_metrics
 
 
@@ -35,7 +37,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(response["sampledAt"], sample.sampled_at)
         self.assertEqual((device["selfMb"], device["othersMb"], device["unattributedMb"]), (5010, 204, 59))
         self.assertTrue(device["callerHasContext"])
-        self.assertNotIn("temperatureC", device)
+        self.assertEqual((device["temperatureC"], device["utilizationPercent"], device["powerWatts"]),
+                         (52.0, 14.0, 32.5))
+        self.assertIsNone(device["smClockMhz"])  # not in the fixture: unknown, not 0
         self.assertEqual([p["owner"] for p in device["processes"]], ["self", "external"])
 
     def test_unix_v1_reports_peer_namespace_pid_only_when_resolved(self):
@@ -47,6 +51,30 @@ class SnapshotTests(unittest.TestCase):
         response = unix_snapshot(parse_xml(xml), 200, 1000, lambda p, caller: p == caller,
                                  lambda p, caller: local.get(p))
         self.assertEqual([p["peerNsPid"] for p in response["devices"][0]["processes"]], [7, None])
+
+    def test_unix_v1_reports_device_readings_and_keeps_unavailable_null(self):
+        xml = XML.replace(b"<nvidia_smi_log>", b"""<nvidia_smi_log>
+          <driver_version>595.58.03</driver_version><cuda_version>13.2</cuda_version>""").replace(
+            b"</gpu>", b"""<product_name>NVIDIA GeForce RTX 3060</product_name>
+          <pci><pci_bus_id>00000000:0B:00.0</pci_bus_id></pci>
+          <fan_speed>N/A</fan_speed><performance_state>P8</performance_state>
+          <clocks><sm_clock>210 MHz</sm_clock><mem_clock>405 MHz</mem_clock></clocks>
+          <max_clocks><sm_clock>2130 MHz</sm_clock></max_clocks>
+          </gpu>""").replace(b"</gpu_power_readings>",
+                             b"<current_power_limit>170.00 W</current_power_limit></gpu_power_readings>")
+        device = unix_snapshot(parse_xml(xml), 200, 1000, lambda p, caller: False,
+                               lambda p, caller: None)["devices"][0]
+        self.assertEqual({key: device[key] for key in DEVICE_TELEMETRY}, {
+            "name": "NVIDIA GeForce RTX 3060", "pciBusId": "00000000:0B:00.0",
+            "driverVersion": "595.58.03", "cudaVersion": "13.2", "temperatureC": 52.0,
+            "utilizationPercent": 14.0, "memoryUtilizationPercent": None, "powerWatts": 32.5,
+            "powerLimitWatts": 170.0, "fanPercent": None, "performanceState": 8,
+            "smClockMhz": 210.0, "smClockMaxMhz": 2130.0, "memClockMhz": 405.0,
+        })
+
+    def test_vm_v2_does_not_gain_device_readings(self):
+        reply = vm_snapshot(parse_xml(XML), {UUID})
+        self.assertNotIn("temperatureC", reply["devices"][0])
 
     def test_peer_namespace_pid_reads_own_namespace_and_rejects_missing(self):
         me = os.getpid()
