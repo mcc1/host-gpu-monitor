@@ -27,7 +27,14 @@ Send one newline-terminated UTF-8 JSON line, read one line, then close.
 A successful v1 response includes `source`
 (`host-processes`), `status` (`ok`), `sampledAt` (Unix ms), `peerHostPid`,
 `peerHostUid` and `devices`. Each device has GPU UUID, memory in MiB, process
-rows and caller-relative `selfMb`, `othersMb` and `callerHasContext`. A caller
+rows and caller-relative `selfMb`, `othersMb` and `callerHasContext`. Each
+process row has `peerNsPid`: its PID as numbered in the caller's PID namespace
+when it lives in that same namespace (for example another process in the same
+LXC), else `null`. Processes in nested namespaces, such as Docker inside an
+LXC, stay `null`. A client can use it to match host rows to its own `/proc`
+without guessing. The value is read when the response is built, so a PID that
+exits and is reused within the one-second sample cache can be misattributed.
+A caller
 with no GPU context can still read the physical inventory. Unavailable data
 returns `status:"unknown"` with a reason. Requests and responses are bounded.
 

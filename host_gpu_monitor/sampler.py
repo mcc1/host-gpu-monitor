@@ -30,6 +30,24 @@ def is_descendant(pid, ancestor):
     return False
 
 
+def peer_namespace_pid(pid, peer):
+    """PID of a host process as numbered in the peer's PID namespace, or None.
+
+    Only a process in the peer's own PID namespace gets a number: the peer can
+    already see that process, so this discloses nothing new. Processes in other
+    namespaces, nested ones included, stay None.
+    """
+    try:
+        if os.readlink(f"/proc/{pid}/ns/pid") != os.readlink(f"/proc/{peer}/ns/pid"):
+            return None
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("NSpid:"):
+                return int(line.split()[-1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def workload_label(pid):
     try:
         parts = Path(f"/proc/{pid}/cgroup").read_text().split("/")
@@ -147,11 +165,12 @@ class Sampler:
         return None
 
 
-def unix_snapshot(sample, pid, uid, descendant=is_descendant):
+def unix_snapshot(sample, pid, uid, descendant=is_descendant, local_pid=peer_namespace_pid):
     devices = []
     for device in sample.devices:
         processes = [
-            {**p, "owner": "self" if descendant(p["pid"], pid) else "external"}
+            {**p, "owner": "self" if descendant(p["pid"], pid) else "external",
+             "peerNsPid": local_pid(p["pid"], pid)}
             for p in device["processes"]
         ]
         self_mb = sum(p["usedMb"] for p in processes if p["owner"] == "self")

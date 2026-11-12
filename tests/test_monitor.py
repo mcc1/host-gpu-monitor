@@ -13,7 +13,7 @@ from unittest.mock import patch
 from host_gpu_monitor.__main__ import execution_locks, policies
 from host_gpu_monitor.daemon import local_listener, request_handler
 from host_gpu_monitor import lxc
-from host_gpu_monitor.sampler import Sampler, parse_xml, unix_snapshot
+from host_gpu_monitor.sampler import Sampler, parse_xml, peer_namespace_pid, unix_snapshot
 from host_gpu_monitor.telemetry import handler, render_metrics
 
 
@@ -37,6 +37,21 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(device["callerHasContext"])
         self.assertNotIn("temperatureC", device)
         self.assertEqual([p["owner"] for p in device["processes"]], ["self", "external"])
+
+    def test_unix_v1_reports_peer_namespace_pid_only_when_resolved(self):
+        xml = XML.replace(b"</gpu>", b"""<processes>
+          <process_info><pid>200</pid><process_name>/example/renderer</process_name><used_memory>5010 MiB</used_memory></process_info>
+          <process_info><pid>201</pid><process_name>/example/embedding</process_name><used_memory>204 MiB</used_memory></process_info>
+          </processes></gpu>""")
+        local = {200: 7}
+        response = unix_snapshot(parse_xml(xml), 200, 1000, lambda p, caller: p == caller,
+                                 lambda p, caller: local.get(p))
+        self.assertEqual([p["peerNsPid"] for p in response["devices"][0]["processes"]], [7, None])
+
+    def test_peer_namespace_pid_reads_own_namespace_and_rejects_missing(self):
+        me = os.getpid()
+        self.assertEqual(peer_namespace_pid(me, me), me)
+        self.assertIsNone(peer_namespace_pid(2**22 + 12345, me))
 
     def test_execution_owner_requires_the_exact_exclusive_flock(self):
         with tempfile.TemporaryDirectory() as directory:
